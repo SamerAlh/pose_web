@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Pose + Angles + Rolling Graph (Browser)</title>
+  <style>
+    :root { --pad:16px; }
+    body{margin:0;background:#111;color:#eee;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:var(--pad)}
+    .row{display:flex;gap:12px;align-items:flex-start;flex-wrap:nowrap}
+    .vidbox{position:relative;display:inline-block;max-width:100%}
+    video{background:#000;border-radius:12px;transform:scaleX(-1);max-width:100%;height:auto}
+    canvas.overlay{position:absolute;left:0;top:0;pointer-events:none;border-radius:12px;transform:scaleX(-1)}
+    canvas.hud{background:#202020;border-radius:12px;max-width:100%}
+    canvas.graph{display:block;background:#121212;border-radius:12px;max-width:100%}
+    button{padding:10px 14px;border:none;border-radius:10px;background:#2e7d32;color:#fff;font-weight:600;cursor:pointer}
+    .btn{border:1px solid #444;background:#1e1e1e;color:#eee}
+    #fps{position:absolute;left:12px;bottom:10px;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:8px;font-size:14px}
+    #msg{display:none;margin-top:10px;padding:10px;border-radius:10px;background:#2b2b2b;border:1px solid #444}
+    @media (max-width: 900px){
+      .row{flex-direction:column;align-items:stretch}
+      .vidbox, #hud { width:100%; }
+      body{padding:12px}
+    }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0 0 12px">Live Pose – Angles & Rolling Graph</h2>
+
+  <div id="msg"></div>
+
+  <div class="row">
+    <div class="vidbox">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay" class="overlay"></canvas>
+      <div id="fps">FPS: --</div>
+    </div>
+    <canvas id="hud" class="hud"></canvas>
+  </div>
+
+  <canvas id="graph" class="graph" style="margin-top:12px"></canvas>
+
+  <div class="row" style="margin-top:12px;align-items:center;flex-wrap:wrap">
+    <button id="start">Enable Camera</button>
+    <button id="saveCsv" class="btn">Download CSV (≤3 min)</button>
+    <button id="printJson" class="btn">Print keypoints (console)</button>
+    <span style="opacity:.8">Tip: good lighting • stand ~1.5–2.5 m away.</span>
+  </div>
+
+  <!-- ESM build of MediaPipe Tasks -->
+  <script type="module">
+    import { PoseLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    // ---- Tunables ----
+    const UI_HZ    = 15;
+    const HIST_HZ  = 10;
+    const WINDOW_S = 180;
+    const HUD_W_DESKTOP = 480;
+    const BAND_H_DESKTOP = 48;
+    const BAND_H_MOBILE  = 36;
+    const TOP_PAD  = 12;
+    const BOT_PAD  = 28;
+    const X_STEP   = 2;
+
+    // ---- DOM ----
+    const video = document.getElementById('video');
+    const overlay = document.getElementById('overlay');
+    const octx = overlay.getContext('2d');
+    const hud = document.getElementById('hud');
+    const hctx = hud.getContext('2d');
+    const graph = document.getElementById('graph');
+    const gctx = graph.getContext('2d');
+    const startBtn = document.getElementById('start');
+    const saveCsvBtn = document.getElementById('saveCsv');
+    const printJsonBtn = document.getElementById('printJson');
+    const fpsEl = document.getElementById('fps');
+    const msg = document.getElementById('msg');
+
+    // Offscreen canvases for ring buffer graph
+    const gbg = document.createElement('canvas');  // static grid
+    const gbx = gbg.getContext('2d');
+    const gimg = document.createElement('canvas'); // plotted pixels
+    const gix  = gimg.getContext('2d');
+
+    // ---- Helpers / state ----
+    const clamp01 = x => Math.max(0, Math.min(1, x));
+    const getQS = (k)=> new URLSearchParams(location.search).get(k);
+    const wantRear = getQS('rear') === '1';
+    const isSmall = ()=> window.innerWidth <= 900;
+
+    let CUR_BAND_H = BAND_H_DESKTOP;
+    let CUR_HUD_W = HUD_W_DESKTOP;
+
+    function toPx(pt){ return [pt.x * overlay.width, pt.y * overlay.height]; }
+
+    function angleDeg(A,B,C){
+      if(!A||!B||!C) return NaN;
+      const bax=A[0]-B[0], bay=A[1]-B[1];
+      const bcx=C[0]-B[0], bcy=C[1]-B[1];
+      const n1=Math.hypot(bax,bay), n2=Math.hypot(bcx,bcy);
+      if(n1<1e-6||n2<1e-6) return NaN;
+      let cosv=(bax*bcx+bay*bcy)/(n1*n2); cosv=Math.max(-1,Math.min(1,cosv));
+      return Math.acos(cosv)*180/Math.PI;
+    }
+    function angleToVertical(A,B){
+      if(!A||!B) return NaN;
+      const vx=B[0]-A[0], vy=B[1]-A[1], n=Math.hypot(vx,vy);
+      if(n<1e-6) return NaN;
+      let cosv=vy/n; cosv=Math.max(-1,Math.min(1,cosv));
+      return Math.acos(cosv)*180/Math.PI;
+    }
+
+    const IDX = {
+      left_shoulder:11, right_shoulder:12,
+      left_elbow:13, right_elbow:14,
+      left_wrist:15, right_wrist:16,
+      left_hip:23, right_hip:24,
+      left_knee:25, right_knee:26,
+      left_ankle:27, right_ankle:28
+    };
+
+    const BAR = { pad:12, labelW:130, barW:160, gapLR:18, barH:18, rowH:30 };
+    function angleColor(val){
+      if(isNaN(val)) return '#505050';
+      const t = clamp01(val/180), g = Math.round(255*t), r = Math.round(255*(1-t));
+      return `rgb(${r},${g},0)`;
+    }
+    function drawHud(pairs){
+      const H = hud.height;
+      hctx.fillStyle='#202020'; hctx.fillRect(0,0,hud.width,H);
+      hctx.fillStyle='#e6e6e6'; hctx.font='16px system-ui';
+      hctx.fillText('Angles (0→red … 180→green)', BAR.pad, BAR.pad+16);
+      const y0 = BAR.pad + 32;
+      hctx.fillStyle='#a5d0ff';
+      hctx.fillText('L', BAR.pad+BAR.labelW, y0-6);
+      hctx.fillText('R', BAR.pad+BAR.labelW+BAR.barW+BAR.gapLR, y0-6);
+
+      for(let i=0;i<pairs.length;i++){
+        const [name, L, R] = pairs[i];
+        const y = y0 + i*BAR.rowH;
+        hctx.fillStyle='#e0e0e0'; hctx.font='15px system-ui';
+        hctx.fillText(name, BAR.pad, y+BAR.barH-4);
+        function bar(x, val){
+          hctx.strokeStyle='rgb(60,60,60)'; hctx.strokeRect(x, y, BAR.barW, BAR.barH);
+          if (!isNaN(val)){
+            const w = Math.max(0, Math.round(clamp01(val/180)*(BAR.barW-2)));
+            hctx.fillStyle = angleColor(val);
+            hctx.fillRect(x+1, y+1, w, BAR.barH-2);
+            hctx.fillStyle='#eee'; hctx.font='14px system-ui';
+            hctx.fillText(`${val.toFixed(0)}°`, x+BAR.barW+6, y+BAR.barH-5);
+          } else {
+            hctx.fillStyle='#aaa'; hctx.fillText('--', x+BAR.barW+6, y+BAR.barH-5);
+          }
+        }
+        bar(BAR.pad+BAR.labelW, L);
+        bar(BAR.pad+BAR.labelW+BAR.barW+BAR.gapLR, R);
+      }
+      const tickY = y0 + pairs.length*BAR.rowH + 14;
+      hctx.strokeStyle='rgb(120,120,120)';
+      [0,0.5,1].forEach((k,i)=>{
+        const x = BAR.pad+BAR.labelW + Math.round(BAR.barW*k);
+        hctx.beginPath(); hctx.moveTo(x, tickY-6); hctx.lineTo(x, tickY+6); hctx.stroke();
+        hctx.fillStyle='#bdbdbd'; hctx.font='13px system-ui';
+        hctx.fillText(i===0?'0°':(i===1?'90°':'180°'), x-16, tickY+22);
+      });
+    }
+
+    const GRAPH = {
+      bands: [
+        ["Arm–Torso","AL","AR"],
+        ["Elbow","EL","ER"],
+        ["Hip","HL","HR"],
+        ["Knee","KL","KR"],
+        ["Torso","TL","TR"]
+      ]
+    };
+    const LINE_COLS = {
+      AL:'#00ffff', AR:'#ff00ff',
+      EL:'#00c8ff', ER:'#ff50b4',
+      HL:'#00ff99', HR:'#b6ff00',
+      KL:'#0096ff', KR:'#ff9600',
+      TL:'#96ff96', TR:'#9696ff'
+    };
+
+    function initGraphBG(){
+      gbx.fillStyle='#121212'; gbx.fillRect(0,0,gbg.width,gbg.height);
+      GRAPH.bands.forEach((row,bi)=>{
+        const ybase = TOP_PAD + bi*CUR_BAND_H + (CUR_BAND_H>>1) + 8;
+        gbx.strokeStyle='#282828'; gbx.beginPath(); gbx.moveTo(0,ybase); gbx.lineTo(gbg.width,ybase); gbx.stroke();
+        const y90 = ybase - Math.round((90/180)*(CUR_BAND_H-16));
+        gbx.strokeStyle='#1f1f1f'; gbx.beginPath(); gbx.moveTo(0,y90); gbx.lineTo(gbg.width,y90); gbx.stroke();
+        gbx.fillStyle='#c8c8c8'; gbx.font='13px system-ui';
+        gbx.fillText(row[0], 10, ybase - (CUR_BAND_H>>1) + 10);
+        [0,90,180].forEach(deg=>{
+          const yy = ybase - Math.round((deg/180)*(CUR_BAND_H-16));
+          gbx.fillStyle='#888'; gbx.fillText(String(deg), gbg.width-32, yy+4);
+        });
+      });
+    }
+
+    let graphX = 0;
+    function graphPlotColumn(values){
+      const w=gimg.width, h=gimg.height;
+      gix.clearRect(graphX, 0, X_STEP, h);
+      GRAPH.bands.forEach((row,bi)=>{
+        const ybase = TOP_PAD + bi*CUR_BAND_H + (CUR_BAND_H>>1) + 8;
+        [['L',-1],['R',+1]].forEach(([side,shift])=>{
+          const key = row[1 + (side==='L'?0:1)];
+          const v = values[key];
+          if(Number.isFinite(v)){
+            const frac = Math.max(0, Math.min(1, v/180));
+            const y = ybase - Math.round(frac*(CUR_BAND_H-16)) + shift;
+            gix.fillStyle = LINE_COLS[key] || '#ddd';
+            gix.fillRect(graphX, y-1, X_STEP, 2);
+          }
+        });
+      });
+      graphX = (graphX + X_STEP) % w;
+    }
+
+    function renderGraph(){
+      const w=graph.width, h=graph.height, gx=graphX;
+      gctx.clearRect(0,0,w,h);
+      if (gx>0){
+        gctx.drawImage(gbg, gx,0, w-gx,h, 0,0, w-gx,h);
+        gctx.drawImage(gbg, 0,0, gx,h, w-gx,0, gx,h);
+        gctx.drawImage(gimg, gx,0, w-gx,h, 0,0, w-gx,h);
+        gctx.drawImage(gimg, 0,0, gx,h, w-gx,0, gx,h);
+      } else {
+        gctx.drawImage(gbg,0,0);
+        gctx.drawImage(gimg,0,0);
+      }
+      gctx.save();
+      gctx.font = '16px system-ui';
+      gctx.fillStyle = '#e6e6e6';
+      gctx.textAlign = 'center';
+      gctx.textBaseline = 'top';
+      gctx.fillText('Rolling angles (0–180°)', w/2, 4);
+      gctx.restore();
+    }
+
+    // ---- Model & camera ----
+    let landmarker = null;
+
+    async function initModel(){
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      // Try GPU, fall back to CPU for older mobile browsers
+      try{
+        landmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.5,
+          minPosePresenceConfidence: 0.5,
+          minTrackingConfidence: 0.5,
+          outputSegmentationMasks: false
+        });
+      }catch(e){
+        console.warn("GPU delegate failed, retrying with CPU:", e);
+        landmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+            delegate: "CPU"
+          },
+          runningMode: "VIDEO",
+          numPoses: 1
+        });
+      }
+    }
+
+    function secureCheck(){
+      const isSecure = location.protocol==='https:' || location.hostname==='localhost' || location.hostname==='127.0.0.1';
+      if(!isSecure){
+        msg.style.display='block';
+        msg.textContent = "Open this page over HTTPS (or on localhost). On phones, camera access is blocked on plain HTTP (e.g., VS Code Live Server over LAN).";
+        return false;
+      }
+      msg.style.display='none';
+      return true;
+    }
+
+    async function startCamera(){
+      const constraints = {
+        audio:false,
+        video:{
+          facingMode: wantRear ? { ideal:'environment' } : { ideal:'user' },
+          width: { ideal: 1280 },
+          height:{ ideal: 720 }
+        }
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      await video.play();
+      // Layout after we know the real aspect ratio
+      layoutCanvases();
+      initGraphBG();
+      renderGraph();
+    }
+
+    function layoutCanvases(){
+      const ar = (video.videoWidth && video.videoHeight) ? (video.videoWidth / video.videoHeight) : (4/3);
+      const small = isSmall();
+      CUR_BAND_H = small ? BAND_H_MOBILE : BAND_H_DESKTOP;
+      CUR_HUD_W  = small ? Math.min(window.innerWidth - 2*12, 640) : HUD_W_DESKTOP;
+
+      // Video width: fit viewport
+      const maxW = Math.min(640, document.body.clientWidth - 2*12);
+      const V_W = small ? maxW : 640;
+      const V_H = Math.round(V_W / ar);
+
+      // Set element intrinsic sizes
+      video.width = V_W; video.height = V_H;
+      overlay.width = V_W; overlay.height = V_H;
+
+      // HUD matches video height; width responsive
+      hud.width = small ? V_W : CUR_HUD_W;
+      hud.height = V_H;
+
+      // Graph: full width on mobile; video+hud on desktop
+      const bands = GRAPH.bands.length;
+      const GH = TOP_PAD + bands * CUR_BAND_H + BOT_PAD;
+      graph.width  = small ? V_W : (V_W + hud.width);
+      graph.height = GH;
+
+      // Offscreens match onscreen
+      [gbg, gimg].forEach(c => { c.width = graph.width; c.height = graph.height; });
+      gix.clearRect(0,0,gimg.width,gimg.height);
+      graphX = 0;
+    }
+
+    window.addEventListener('resize', ()=>{
+      if (!video.srcObject) return;
+      const oldW = graph.width, oldH = graph.height;
+      layoutCanvases();
+      initGraphBG();
+      renderGraph();
+    });
+
+    // ---- Angles / draw ----
+    let ang = {AL:NaN,AR:NaN,EL:NaN,ER:NaN,HL:NaN,HR:NaN,KL:NaN,KR:NaN,TL:NaN,TR:NaN};
+    let lastLandmarks = null;
+    let lastUI = 0, lastVF = -1, fps=0, fcount=0, tFPS=performance.now();
+    let t0 = 0;
+    let lastHist = 0;
+    const HIST_MS = 1000 / HIST_HZ;
+    const rows = [];
+
+    function computeAngles(lms){
+      const P = (id)=> lms[id] ? toPx(lms[id]) : null;
+      const LSH=P(IDX.left_shoulder), RSH=P(IDX.right_shoulder);
+      const LEL=P(IDX.left_elbow),    REL=P(IDX.right_elbow);
+      const LWR=P(IDX.left_wrist),    RWR=P(IDX.right_wrist);
+      const LHIP=P(IDX.left_hip),     RHIP=P(IDX.right_hip);
+      const LKNE=P(IDX.left_knee),    RKNE=P(IDX.right_knee);
+      const LANK=P(IDX.left_ankle),   RANK=P(IDX.right_ankle);
+      return {
+        EL: angleDeg(LSH, LEL, LWR),
+        ER: angleDeg(RSH, REL, RWR),
+        AL: angleDeg(LEL, LSH, LHIP),
+        AR: angleDeg(REL, RSH, RHIP),
+        HL: angleDeg(LSH, LHIP, LKNE),
+        HR: angleDeg(RSH, RHIP, RKNE),
+        KL: angleDeg(LHIP, LKNE, LANK),
+        KR: angleDeg(RHIP, RKNE, RANK),
+        TL: angleToVertical(LSH, LHIP),
+        TR: angleToVertical(RSH, RHIP),
+      };
+    }
+
+    function drawOverlay(lms){
+      octx.clearRect(0,0,overlay.width,overlay.height);
+      if (!lms) return;
+      const du = new DrawingUtils(octx);
+      du.drawConnectors(lms, PoseLandmarker.POSE_CONNECTIONS);
+      du.drawLandmarks(lms, { radius: () => 4 });
+      const P = (id)=> lms[id] ? toPx(lms[id]) : null;
+      const LSH=P(IDX.left_shoulder), RSH=P(IDX.right_shoulder);
+      const LEL=P(IDX.left_elbow), REL=P(IDX.right_elbow);
+      const LK=P(IDX.left_knee),  RK=P(IDX.right_knee);
+      const LH=P(IDX.left_hip),   RH=P(IDX.right_hip);
+      function label(pt, text){
+        if(!pt) return;
+        octx.fillStyle='rgba(255,255,0,.95)';
+        octx.font='14px system-ui';
+        octx.strokeStyle='rgba(0,0,0,.6)'; octx.lineWidth=3;
+        const [x,y]=pt; octx.strokeText(text, x+6, y-6); octx.fillText(text, x+6, y-6);
+      }
+      if(LEL && Number.isFinite(ang.EL)) label(LEL, `${ang.EL.toFixed(0)}°`);
+      if(REL && Number.isFinite(ang.ER)) label(REL, `${ang.ER.toFixed(0)}°`);
+      if(LK  && Number.isFinite(ang.KL)) label(LK,  `${ang.KL.toFixed(0)}°`);
+      if(RK  && Number.isFinite(ang.KR)) label(RK,  `${ang.KR.toFixed(0)}°`);
+      if(LSH && Number.isFinite(ang.AL)) label(LSH, `${ang.AL.toFixed(0)}°`);
+      if(RSH && Number.isFinite(ang.AR)) label(RSH, `${ang.AR.toFixed(0)}°`);
+      if(LH  && Number.isFinite(ang.HL)) label(LH,  `${ang.HL.toFixed(0)}°`);
+      if(RH  && Number.isFinite(ang.HR)) label(RH,  `${ang.HR.toFixed(0)}°`);
+    }
+
+    function drawHUDNow(){
+      const pairs = [
+        ["Arm–Torso", ang.AL, ang.AR],
+        ["Elbow",     ang.EL, ang.ER],
+        ["Hip",       ang.HL, ang.HR],
+        ["Knee",      ang.KL, ang.KR],
+        ["Torso lean",ang.TL, ang.TR],
+      ];
+      drawHud(pairs);
+    }
+
+    async function loop(){
+      const now = performance.now();
+
+      if (video.readyState >= 2 && video.currentTime !== lastVF && landmarker){
+        const res = landmarker.detectForVideo(video, now);
+        const lms = (res && res.landmarks && res.landmarks[0]) ? res.landmarks[0] : null;
+        lastLandmarks = lms;
+        if (lms){
+          ang = computeAngles(lms);
+          if (now - lastUI >= (1000/UI_HZ)){ drawHUDNow(); drawOverlay(lms); lastUI = now; }
+        } else {
+          octx.clearRect(0,0,overlay.width,overlay.height);
+        }
+        lastVF = video.currentTime;
+      }
+
+      if (now - lastHist >= HIST_MS){
+        const tRel = (now - t0)/1000;
+        const row = { t: +tRel.toFixed(3), ...ang };
+        rows.push(row);
+        while(rows.length && (row.t - rows[0].t > WINDOW_S)) rows.shift();
+        graphPlotColumn(row);
+        renderGraph();
+        lastHist = now;
+      }
+
+      if (++fcount % 10 === 0){
+        const n = performance.now(); fps = 10*1000/(n - tFPS); tFPS = n;
+        fpsEl.textContent = `FPS: ${fps.toFixed(1)}`;
+      }
+      requestAnimationFrame(loop);
+    }
+
+    function downloadCSV(){
+      if (!rows.length) return;
+      const tEnd = rows[rows.length-1].t;
+      const filtered = rows.filter(r=> r.t >= tEnd - WINDOW_S);
+      const cols = ["t","AL","AR","EL","ER","HL","HR","KL","KR","TL","TR"];
+      let csv = cols.join(",")+"\n";
+      for (const r of filtered){
+        csv += cols.map(k=>{
+          const v = r[k];
+          return (typeof v === 'number' && !Number.isFinite(v)) ? "" : v;
+        }).join(",") + "\n";
+      }
+      const ts = new Date().toISOString().replace(/[-:]/g,"").slice(0,15).replace('T','_');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], {type:"text/csv"}));
+      a.download = `angle_log_${ts}.csv`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    startBtn.onclick = async () => {
+      startBtn.disabled = true;
+      try{
+        if (!secureCheck()) throw new Error("Needs HTTPS (or localhost) to access the camera.");
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera API not available in this browser.");
+        await initModel();
+        await startCamera();
+        t0 = performance.now();
+        lastHist = t0;
+        requestAnimationFrame(loop);
+      }catch(e){
+        alert(e.name + ': ' + e.message);
+        startBtn.disabled = false;
+      }
+    };
+    saveCsvBtn.onclick = downloadCSV;
+    printJsonBtn.onclick = ()=>{
+      if (!lastLandmarks){ console.log("No pose yet."); return; }
+      const out = lastLandmarks.map((lm,i)=>({
+        i, x:+lm.x.toFixed(5), y:+lm.y.toFixed(5), z:+(lm.z??0).toFixed(5), visibility:+(lm.visibility??0).toFixed(3)
+      }));
+      console.log(JSON.stringify({width:overlay.width,height:overlay.height,timestamp:Date.now()/1000,keypoints:out},null,2));
+    };
+
+    // Proactive HTTPS hint if needed
+    secureCheck();
+  </script>
+</body>
+</html>
